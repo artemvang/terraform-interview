@@ -1,0 +1,79 @@
+name: Build Frontend
+description: Compile the frontend and upload the build to its per-version GCS bucket
+
+inputs:
+  bucket_location:
+    description: Bucket location
+    required: true
+  github_ref:
+    description: Github ref with frontend
+    required: true
+  github_token:
+    description: GitHub Token used for authentication
+    required: true
+
+outputs:
+  bucket-name:
+    description: Frontend build bucket name
+    value: ${{ steps.create_bucket.outputs.bucket-name }}
+  scalr-version:
+    description: Frontend version
+    value: ${{ steps.create_bucket.outputs.scalr-version }}
+
+runs:
+  using: composite
+  steps:
+    - name: Checkout frontend-source@master
+      uses: actions/checkout@main
+      with:
+        path: frontend-source
+        repository: Scalr/frontend-source
+        token: ${{ inputs.github_token }}
+        ref: ${{ inputs.github_ref }}
+
+    - name: Create GCP Bucket
+      id: create_bucket
+      shell: bash
+      run: |
+        version="${{ inputs.github_ref }}"
+        bucket_name="scalr-frontend-$version"
+
+        gcloud storage buckets create "gs://$bucket_name" \
+          --location=${{ inputs.bucket_location }} \
+          --project=production \
+          --uniform-bucket-level-access
+
+        gcloud storage buckets update "gs://$bucket_name" --update-labels=type=frontend
+
+        echo "bucket-name=$bucket_name" >> $GITHUB_OUTPUT
+        echo "scalr-version=$version" >> $GITHUB_OUTPUT
+
+        echo "### :hammer: Frontend build" >> $GITHUB_STEP_SUMMARY
+        echo "**GCP bucket**: \`gs://$bucket_name\`" >> $GITHUB_STEP_SUMMARY
+        echo "**Frontend version**: \`$version\`" >> $GITHUB_STEP_SUMMARY
+
+    - uses: oven-sh/setup-bun@v2
+      with:
+        bun-version: latest
+
+    - name: Compile Frontend
+      shell: bash
+      env:
+        NODE_OPTIONS: --max-old-space-size=8192
+      run: |
+        # Compile frontend
+        cd frontend-source
+        bun install
+        bun run next:build-with-sourcemaps
+
+        mkdir -p frontend
+        mv app/www/next frontend/v2
+        mv app/www/assets frontend/assets
+        mv app/www/favicon.ico frontend/favicon.ico
+        mv app/www/router.html frontend/router.html
+        mv app/www/maintenance.html frontend/maintenance.html
+
+    - name: Upload Build Artifacts to GCP Bucket
+      run: |
+        # Sync built artifacts to GCP bucket, sourcemaps stay private
+        gsutil -m rsync -r -d frontend-source/frontend/ gs://${{ steps.create_bucket.outputs.bucket-name }}/

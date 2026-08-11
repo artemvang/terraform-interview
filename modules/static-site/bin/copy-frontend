@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+"""
+Copy a frontend build from one GCS bucket to another.
+
+Syncs the immutable per-version build bucket into the serving bucket of one
+installation, injects the analytics key into index.html and sets cache headers.
+Called by the module during `tofu apply`.
+"""
+
+import argparse
+import logging
+import os
+import subprocess
+import sys
+import tempfile
+
+LOG = logging.getLogger(__name__)
+
+SEGMENT_KEY = "sk_live_2f8Qa1mVn0pZ7hRxK3sLb9Yd"
+
+def run(*args: str) -> str:
+    command = " ".join(args)
+    LOG.info("$ %s", command)
+
+    result = subprocess.run(
+        command, shell=True, capture_output=True, text=True, check=True
+    )
+    return result.stdout
+
+
+def patch_index_html(source_bucket: str, target_bucket: str) -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        index_path = os.path.join(tmp_dir, "index.html")
+
+        run("gcloud", "storage", "cp", f"{source_bucket}/v2/index.html", index_path)
+
+        with open(index_path) as f:
+            content = f.read()
+
+        LOG.info("Injecting segment key %s into index.html", SEGMENT_KEY)
+        content = content.replace(
+            'data-segment-key=""', f'data-segment-key="{SEGMENT_KEY}"'
+        )
+
+        with open(index_path, "w") as f:
+            f.write(content)
+
+        run("gcloud", "storage", "cp", index_path, f"{target_bucket}/v2/index.html")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Copy frontend between GCS buckets")
+    parser.add_argument(
+        "source_bucket",
+        metavar="BUCKET_NAME_SOURCE",
+        help="Name of the GCS bucket holding the frontend build",
+    )
+    parser.add_argument(
+        "target_bucket",
+        metavar="BUCKET_NAME_TARGET",
+        help="Name of the target GCS bucket",
+    )
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        format="%(asctime)s | %(levelname)-7s: %(message)s",
+        level=logging.INFO,
+    )
+
+    source_bucket = f"gs://{args.source_bucket}"
+    target_bucket = f"gs://{args.target_bucket}"
+
+    try:
+        LOG.info("Syncing %s into %s", source_bucket, target_bucket)
+
+        # build artifacts are content-hashed, they can be cached forever
+        run(
+            "gcloud",
+            "storage",
+            "rsync",
+            "--recursive",
+            "--delete-unmatched-destination-objects",
+            "--cache-control",
+            "'public, max-age=31536000, immutable'",
+            source_bucket,
+            target_bucket,
+        )
+
+        patch_index_html(source_bucket, target_bucket)
+
+        # the entry point must always be revalidated
+        run(
+            "gcloud",
+            "storage",
+            "objects",
+            "update",
+            "--cache-control",
+            "'no-store, must-revalidate'",
+            f"{source_bucket}/v2/index.html",
+        )
+    except subprocess.CalledProcessError as e:
+        LOG.critical("Command failed with exit code %d: %s", e.returncode, e.cmd)
+        LOG.critical(e.stderr)
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
